@@ -13,6 +13,13 @@
  # ###########################################################################
 
 from __future__ import with_statement
+
+# This module MUST NOT import threading in global scope. This is because in a direct (non-ptvsd)
+# attach scenario, it is loaded on the injected debugger attach thread, and if threading module
+# hasn't been loaded already, it will assume that the thread on which it is being loaded is the
+# main thread. This will cause issues when the thread goes away after attach completes.
+_threading = None
+
 import sys
 import ctypes
 try:
@@ -128,6 +135,9 @@ class SynthesizedValue(object):
 DONT_DEBUG = [path.normcase(__file__), path.normcase(_vspu.__file__)]
 if sys.version_info >= (3, 3):
     DONT_DEBUG.append(path.normcase('<frozen importlib._bootstrap>'))
+if sys.version_info >= (3, 5):
+    DONT_DEBUG.append(path.normcase('<frozen importlib._bootstrap_external>'))
+
 # Contains information about all breakpoints in the process. Keys are line numbers on which
 # there are breakpoints in any file, and values are dicts. For every line number, the
 # corresponding dict contains all the breakpoints that fall on that line. The keys in that
@@ -529,10 +539,6 @@ if hasattr(sys, 'base_prefix'):
     PREFIXES.append(path.normcase(sys.base_prefix))
 if hasattr(sys, 'real_prefix'):
     PREFIXES.append(path.normcase(sys.real_prefix))
-# If one or more of the prefixes are empty, we can't reliably distinguish stdlib
-# from user code, so override stdlib-only mode and allow to debug everything.
-if '' in PREFIXES:
-    DEBUG_STDLIB = True
 
 def should_debug_code(code):
     if not code or not code.co_filename:
@@ -1527,12 +1533,11 @@ class Thread(object):
                     write_object(conn, type_obj, safe_repr_obj, hex_repr_obj, type_name, obj_len)
 
     def enum_thread_frames_locally(self):
-        global threading
-        if threading is None:
+        global _threading
+        if _threading is None:
             import threading
-        self.send_frame_list(self.get_frame_list(), getattr(threading.currentThread(), 'name', 'Python Thread'))
-
-threading = None
+            _threading = threading
+        self.send_frame_list(self.get_frame_list(), getattr(_threading.currentThread(), 'name', 'Python Thread'))
 
 class Module(object):
     """tracks information about a loaded module"""
@@ -2128,20 +2133,28 @@ def write_object(conn, obj_type, obj_repr, hex_repr, type_name, obj_len, flags =
 
 debugger_thread_id = -1
 _INTERCEPTING_FOR_ATTACH = False
+
 def intercept_threads(for_attach = False):
     thread.start_new_thread = thread_creator
     thread.start_new = thread_creator
-    global threading
-    if threading is None:
-        # we need to patch threading._start_new_thread so that 
-        # we pick up new threads in the attach case when threading
-        # is already imported.
+
+    # If threading has already been imported (i.e. we're attaching), we must hot-patch threading._start_new_thread
+    # so that new threads started using it will be intercepted by our code.
+    #
+    # On the other hand, if threading has not been imported, we must not import it ourselves, because it will then
+    # treat the current thread as the main thread, which is incorrect when attaching because this code is executing
+    # on an ephemeral debugger attach thread that will go away shortly. We don't need to hot-patch it in that case
+    # anyway, because it will pick up the new thread.start_new_thread that we have set above when it's imported.
+    global _threading
+    if _threading is None and 'threading' in sys.modules:
         import threading
-        threading._start_new_thread = thread_creator
+        _threading = threading
+        _threading._start_new_thread = thread_creator
+
     global _INTERCEPTING_FOR_ATTACH
     _INTERCEPTING_FOR_ATTACH = for_attach
 
-def attach_process(port_num, debug_id, report = False, block = False):
+def attach_process(port_num, debug_id, debug_options, report = False, block = False):
     global conn
     for i in xrange(50):
         try:
@@ -2155,12 +2168,36 @@ def attach_process(port_num, debug_id, report = False, block = False):
             time.sleep(50./1000)
     else:
         raise Exception('failed to attach')
-    attach_process_from_socket(conn, report, block)
+    attach_process_from_socket(conn, debug_options, report, block)
 
-def attach_process_from_socket(sock, report = False, block = False):
-    global conn
-    global DETACHED
-    global attach_sent_break
+def attach_process_from_socket(sock, debug_options, report = False, block = False):
+    global conn, attach_sent_break, DETACHED, DEBUG_STDLIB, BREAK_ON_SYSTEMEXIT_ZERO, DJANGO_DEBUG
+
+    BREAK_ON_SYSTEMEXIT_ZERO = 'BreakOnSystemExitZero' in debug_options
+    DJANGO_DEBUG = 'DjangoDebugging' in debug_options
+
+    if '' in PREFIXES:
+        # If one or more of the prefixes are empty, we can't reliably distinguish stdlib
+        # from user code, so override stdlib-only mode and allow to debug everything.
+        DEBUG_STDLIB = True
+    else:
+        DEBUG_STDLIB = 'DebugStdLib' in debug_options
+
+    wait_on_normal_exit = 'WaitOnNormalExit' in debug_options
+    wait_on_abnormal_exit = 'WaitOnAbnormalExit' in debug_options
+
+    def _excepthook(exc_type, exc_value, exc_tb):
+        # Display the exception and wait on exit
+        if exc_type is SystemExit:
+            if (wait_on_abnormal_exit and exc_value.code != 0) or (wait_on_normal_exit and exc_value.code == 0):
+                print_exception(exc_type, exc_value, exc_tb)
+                do_wait()
+        else:
+            print_exception(exc_type, exc_value, exc_tb)
+            if wait_on_abnormal_exit:
+                do_wait()
+    sys.excepthook = sys.__excepthook__ = _excepthook
+
     conn = sock
     attach_sent_break = False
 
@@ -2199,6 +2236,9 @@ def attach_process_from_socket(sock, report = False, block = False):
     # intercept all new thread requests
     if not _INTERCEPTING_FOR_ATTACH:
         intercept_threads()
+
+    if 'RedirectOutput' in debug_options:
+        enable_output_redirection()
 
 # Try to detach cooperatively, notifying the debugger as we do so.
 def detach_process_and_notify_debugger():
@@ -2394,45 +2434,18 @@ def print_exception(exc_type, exc_value, exc_tb):
     for out in traceback.format_exception_only(exc_type, exc_value):
         sys.stdout.write(out)
 
-def debug(
-    file,
-    port_num,
-    debug_id,
-    wait_on_exception,
-    redirect_output,
-    wait_on_exit,
-    break_on_systemexit_zero = False,
-    debug_stdlib = False,
-    django_debugging = False,
-    run_as = 'script'
-):
+def parse_debug_options(s):
+    return set([opt.strip() for opt in s.split(',')])
+
+def debug(file, port_num, debug_id, debug_options, run_as = 'script'):
     # remove us from modules so there's no trace of us
     sys.modules['$visualstudio_py_debugger'] = sys.modules['visualstudio_py_debugger']
     __name__ = '$visualstudio_py_debugger'
     del sys.modules['visualstudio_py_debugger']
 
-    global BREAK_ON_SYSTEMEXIT_ZERO, DEBUG_STDLIB, DJANGO_DEBUG
-    BREAK_ON_SYSTEMEXIT_ZERO = break_on_systemexit_zero
-    if not DEBUG_STDLIB:
-        DEBUG_STDLIB = debug_stdlib
-    DJANGO_DEBUG = django_debugging
+    wait_on_normal_exit = 'WaitOnNormalExit' in debug_options
 
-    def _excepthook(exc_type, exc_value, exc_tb):
-        # Display the exception and wait on exit
-        if exc_type is SystemExit:
-            if (wait_on_exception and exc_value.code != 0) or (wait_on_exit and exc_value.code == 0):
-                print_exception(exc_type, exc_value, exc_tb)
-                do_wait()
-        else:
-            print_exception(exc_type, exc_value, exc_tb)
-            if wait_on_exception:
-                do_wait()
-    sys.excepthook = sys.__excepthook__ = _excepthook
-
-    attach_process(port_num, debug_id, report = True)
-
-    if redirect_output:
-        enable_output_redirection()
+    attach_process(port_num, debug_id, debug_options, report = True)
 
     # setup the current thread
     cur_thread = new_thread()
@@ -2459,16 +2472,17 @@ def debug(
 
         # Give VS debugger a chance to process commands
         # by waiting for ack of "last" command
-        global threading
-        if threading is None:
+        global _threading
+        if _threading is None:
             import threading
+            _threading = threading
         global last_ack_event
-        last_ack_event = threading.Event()
+        last_ack_event = _threading.Event()
         with _SendLockCtx:
             write_bytes(conn, LAST)
         last_ack_event.wait(5)
 
-    if wait_on_exit:
+    if wait_on_normal_exit:
         do_wait()
 
 # Code objects for functions which are going to be at the bottom of the stack, right below the first

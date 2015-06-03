@@ -41,7 +41,7 @@ namespace PythonToolsTests {
         public void ExecuteTest() {
             using (var evaluator = MakeEvaluator()) {
                 var window = new MockReplWindow(evaluator);
-                evaluator.Initialize(window);
+                evaluator._Initialize(window);
 
                 TestOutput(window, evaluator, "print 'hello'", true, "hello");
                 TestOutput(window, evaluator, "42", true, "42");
@@ -60,7 +60,7 @@ namespace PythonToolsTests {
         public void TestAbort() {
             using (var evaluator = MakeEvaluator()) {
                 var window = new MockReplWindow(evaluator);
-                evaluator.Initialize(window);
+                evaluator._Initialize(window);
 
                 TestOutput(
                     window,
@@ -99,7 +99,7 @@ namespace PythonToolsTests {
         public async Task TestGetAllMembers() {
             using (var evaluator = MakeEvaluator()) {
                 var window = new MockReplWindow(evaluator);
-                await evaluator.Initialize(window);
+                await evaluator._Initialize(window);
 
                 await evaluator.ExecuteText("globals()['my_new_value'] = 123");
                 var names = evaluator.GetMemberNames("");
@@ -178,7 +178,9 @@ g()",
             var python = PythonPaths.Python27 ?? PythonPaths.Python27_x64 ?? PythonPaths.Python26 ?? PythonPaths.Python26_x64;
             python.AssertInstalled();
             var provider = new SimpleFactoryProvider(python.InterpreterPath, python.InterpreterPath);
-            return new PythonReplEvaluator(provider.GetInterpreterFactories().First(), PythonToolsTestUtilities.CreateMockServiceProvider(), new ReplTestReplOptions());
+            var eval = new PythonReplEvaluator(provider.GetInterpreterFactories().First(), PythonToolsTestUtilities.CreateMockServiceProvider(), new ReplTestReplOptions());
+            Assert.IsTrue(eval._Initialize(new MockReplWindow(eval)).Result.IsSuccessful);
+            return eval;
         }
 
         class SimpleFactoryProvider : IPythonInterpreterFactoryProvider {
@@ -280,7 +282,7 @@ g()",
             );
             var replEval = new PythonReplEvaluator(emptyFact, PythonToolsTestUtilities.CreateMockServiceProvider(), new ReplTestReplOptions());
             var replWindow = new MockReplWindow(replEval);
-            replEval.Initialize(replWindow);
+            replEval._Initialize(replWindow);
             var execute = replEval.ExecuteText("42");
             Console.WriteLine(replWindow.Error);
             Assert.IsTrue(
@@ -301,7 +303,7 @@ g()",
             );
             var replEval = new PythonReplEvaluator(emptyFact, PythonToolsTestUtilities.CreateMockServiceProvider(), new ReplTestReplOptions());
             var replWindow = new MockReplWindow(replEval);
-            replEval.Initialize(replWindow);
+            replEval._Initialize(replWindow);
             var execute = replEval.ExecuteText("42");
             var errorText = replWindow.Error;
             const string expected = 

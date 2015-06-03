@@ -17,23 +17,22 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Reflection;
 using System.Runtime.ExceptionServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.PythonTools.Debugger;
+using Microsoft.PythonTools.Debugger.Remote;
 using Microsoft.PythonTools.Parsing;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Microsoft.VisualStudioTools;
 using Microsoft.VisualStudioTools.Project;
-using Microsoft.Win32;
 using TestUtilities;
 using TestUtilities.Python;
 
 namespace DebuggerTests {
-    [TestClass]
-    public class DebuggerTests : BaseDebuggerTests {
+    [TestClass, Ignore]
+    public abstract class DebuggerTests : BaseDebuggerTests {
         [ClassInitialize]
         public static void DoDeployment(TestContext context) {
             AssertListener.Initialize();
@@ -878,7 +877,7 @@ namespace DebuggerTests {
             // Bug 503: http://pytools.codeplex.com/workitem/503
             StepTest(Path.Combine(DebuggerTestPath, "SteppingTestBug503.py"),
                 new[] { 6, 12 },
-                new Action<PythonProcess>[] { 
+                new Action<PythonProcess>[] {
                     (x) => {},
                     (x) => {},
                 },
@@ -1264,7 +1263,7 @@ namespace DebuggerTests {
         [TestMethod, Priority(0)]
         public void TestBreakpointsConditionalWhenTrue() {
             new BreakpointTest(this, "BreakpointTest2.py") {
-                Breakpoints = { 
+                Breakpoints = {
                     new Breakpoint(3) {
                         ConditionKind = PythonBreakpointConditionKind.WhenTrue,
                         Condition = "i == 1",
@@ -1303,7 +1302,7 @@ namespace DebuggerTests {
             var expectedHitCounts = new Queue<int>(new[] { 3, 6, 9 });
 
             new BreakpointTest(this, "BreakpointTest5.py") {
-                Breakpoints = { 
+                Breakpoints = {
                     new Breakpoint(3) {
                         PassCountKind = PythonBreakpointPassCountKind.Every,
                         PassCount = 3,
@@ -1323,7 +1322,7 @@ namespace DebuggerTests {
         [TestMethod, Priority(0)]
         public void TestBreakpointsPassCountWhenEqual() {
             new BreakpointTest(this, "BreakpointTest5.py") {
-                Breakpoints = { 
+                Breakpoints = {
                     new Breakpoint(3) {
                         PassCountKind = PythonBreakpointPassCountKind.WhenEqual,
                         PassCount = 5,
@@ -1343,7 +1342,7 @@ namespace DebuggerTests {
             var expectedHitCounts = new Queue<int>(new[] { 8, 9, 10 });
 
             new BreakpointTest(this, "BreakpointTest5.py") {
-                Breakpoints = { 
+                Breakpoints = {
                     new Breakpoint(3) {
                         PassCountKind = PythonBreakpointPassCountKind.WhenEqualOrGreater,
                         PassCount = 8,
@@ -1363,7 +1362,7 @@ namespace DebuggerTests {
         [TestMethod, Priority(0)]
         public void TestBreakpointsPassCountAndCondition() {
             new BreakpointTest(this, "BreakpointTest5.py") {
-                Breakpoints = { 
+                Breakpoints = {
                     new Breakpoint(3) {
                         ConditionKind = PythonBreakpointConditionKind.WhenTrue,
                         Condition = "i % 2 == 0",
@@ -1427,7 +1426,7 @@ namespace DebuggerTests {
 
             new BreakpointTest(this, "CallStackTest.py") {
                 WaitForExit = false,
-                Breakpoints = { 
+                Breakpoints = {
                     new Breakpoint(7) {
                         OnHit = args => {
                             var actualNames = args.Thread.Frames.Select(f => f.GetQualifiedFunctionName());
@@ -2543,7 +2542,7 @@ int main(int argc, char* argv[]) {
         [TestMethod, Priority(0)]
         public void AttachAndStepWithBlankSysPrefix() {
             string script = TestData.GetPath(@"TestData\DebuggerProject\InfiniteRunBlankPrefix.py");
-            var p = Process.Start(Version.InterpreterPath, "\"" + script  + "\"");
+            var p = Process.Start(Version.InterpreterPath, "\"" + script + "\"");
             try {
                 Thread.Sleep(1000);
                 var proc = PythonProcess.Attach(p.Id);
@@ -2581,6 +2580,113 @@ int main(int argc, char* argv[]) {
 
                     Assert.AreEqual(oldFrame.FileName, newFrame.FileName);
                     Assert.IsTrue(oldFrame.LineNo + 1 == newFrame.LineNo);
+                } finally {
+                    DetachProcess(proc);
+                }
+            } finally {
+                DisposeProcess(p);
+            }
+        }
+
+        [TestMethod, Priority(0)]
+        public virtual void AttachWithOutputRedirection() {
+            var expectedOutput = new[] { "stdout", "stderr" };
+
+            string script = TestData.GetPath(@"TestData\DebuggerProject\AttachOutput.py");
+            var p = Process.Start(Version.InterpreterPath, "\"" + script + "\"");
+            try {
+                Thread.Sleep(1000);
+                var proc = PythonProcess.Attach(p.Id, PythonDebugOptions.RedirectOutput);
+                try {
+                    var attached = new AutoResetEvent(false);
+                    proc.ProcessLoaded += (sender, args) => {
+                        Console.WriteLine("Process loaded");
+                        attached.Set();
+                    };
+                    proc.StartListening();
+
+                    Assert.IsTrue(attached.WaitOne(20000), "Failed to attach within 20s");
+                    proc.Resume();
+
+                    var bpHit = new AutoResetEvent(false);
+                    PythonThread thread = null;
+                    proc.BreakpointHit += (sender, args) => {
+                        thread = args.Thread;
+                        bpHit.Set();
+                    };
+                    var bp = proc.AddBreakPoint(script, 5);
+                    bp.Add();
+
+                    Assert.IsTrue(bpHit.WaitOne(20000), "Failed to hit breakpoint within 20s");
+                    Assert.IsNotNull(thread);
+
+                    var actualOutput = new List<string>();
+                    proc.DebuggerOutput += (sender, e) => {
+                        Console.WriteLine("Debugger output: '{0}'", e.Output);
+                        actualOutput.Add(e.Output);
+                    };
+
+                    var frame = thread.Frames[0];
+                    Assert.AreEqual("False", frame.ExecuteTextAsync("attached").Result.StringRepr);
+                    Assert.IsTrue(frame.ExecuteTextAsync("attached = True").Wait(20000), "Failed to complete evaluation within 20s");
+
+                    proc.Resume();
+                    proc.WaitForExit();
+                    AssertUtil.ArrayEquals(expectedOutput, actualOutput);
+                } finally {
+                    DetachProcess(proc);
+                }
+            } finally {
+                DisposeProcess(p);
+            }
+        }
+
+        [TestMethod, Priority(0)]
+        public void AttachPtvsd() {
+            var expectedOutput = new[] { "stdout", "stderr" };
+
+            string script = TestData.GetPath(@"TestData\DebuggerProject\AttachPtvsd.py");
+            var psi = new ProcessStartInfo(Version.InterpreterPath, "\"" + script + "\"") {
+                WorkingDirectory = TestData.GetPath(),
+                UseShellExecute = false
+            };
+
+            var p = Process.Start(psi);
+            try {
+                Thread.Sleep(1000);
+                var proc = PythonRemoteProcess.Attach(
+                    new Uri("tcp://secret@localhost?opt=" + PythonDebugOptions.RedirectOutput),
+                    warnAboutAuthenticationErrors: false);
+                try {
+                    var attached = new AutoResetEvent(false);
+                    proc.ProcessLoaded += (sender, e) => {
+                        Console.WriteLine("Process loaded");
+
+                        var bp = proc.AddBreakPoint(script, 10);
+                        bp.Add();
+
+                        proc.Resume();
+                        attached.Set();
+                    };
+
+                    var actualOutput = new List<string>();
+                    proc.DebuggerOutput += (sender, e) => {
+                        actualOutput.Add(e.Output);
+                    };
+
+                    var bpHit = new AutoResetEvent(false);
+                    proc.BreakpointHit += (sender, args) => {
+                        Console.WriteLine("Breakpoint hit");
+                        bpHit.Set();
+                        proc.Continue();
+                    };
+
+                    proc.StartListening();
+                    Assert.IsTrue(attached.WaitOne(20000), "Failed to attach within 20s");
+                    Assert.IsTrue(bpHit.WaitOne(20000), "Failed to hit breakpoint within 20s");
+
+                    p.WaitForExit();
+                    AssertUtil.ArrayEquals(expectedOutput, actualOutput);
                 } finally {
                     DetachProcess(proc);
                 }
@@ -2680,6 +2786,27 @@ int main(int argc, char* argv[]) {
         #endregion
 
         #region Output Tests
+
+        [TestMethod, Priority(0)]
+        public void TestOutputRedirection() {
+            var debugger = new PythonDebugger();
+            var expectedOutput = new Queue<string>(new[] { "stdout", "stderr" });
+
+            var process = DebugProcess(debugger, Path.Combine(DebuggerTestPath, "Output.py"), (processObj, threadObj) => {
+                processObj.DebuggerOutput += (sender, e) => {
+                    if (expectedOutput.Count != 0) {
+                        Assert.AreEqual(expectedOutput.Dequeue(), e.Output);
+                    }
+                };
+            }, debugOptions: PythonDebugOptions.RedirectOutput);
+
+            try {
+                process.Start();
+                Thread.Sleep(1000);
+            } finally {
+                WaitForExit(process);
+            }
+        }
 
         [TestMethod, Priority(0)]
         public void Test3xStdoutBuffer() {
@@ -2841,7 +2968,7 @@ int main(int argc, char* argv[]) {
 
         internal override PythonVersion Version {
             get {
-                return PythonPaths.Python34 ?? PythonPaths.Python34_x64;
+                return PythonPaths.Python34;
             }
         }
 
@@ -2853,6 +2980,21 @@ int main(int argc, char* argv[]) {
 
         public override void AttachNewThread_PyThreadState_New() {
             // PyEval_AcquireLock deprecated in 3.2
+        }
+    }
+
+    [TestClass]
+    public class DebuggerTests34_x64 : DebuggerTests34 {
+        [ClassInitialize]
+        public static new void DoDeployment(TestContext context) {
+            AssertListener.Initialize();
+            PythonTestData.Deploy();
+        }
+
+        internal override PythonVersion Version {
+            get {
+                return PythonPaths.Python34_x64;
+            }
         }
     }
 
@@ -2882,7 +3024,7 @@ int main(int argc, char* argv[]) {
     }
 
     [TestClass]
-    public class DebuggerTests27 : DebuggerTests {
+    public class DebuggerTests35_x64 : DebuggerTests35 {
         [ClassInitialize]
         public static new void DoDeployment(TestContext context) {
             AssertListener.Initialize();
@@ -2891,7 +3033,7 @@ int main(int argc, char* argv[]) {
 
         internal override PythonVersion Version {
             get {
-                return PythonPaths.Python27 ?? PythonPaths.Python27_x64;
+                return PythonPaths.Python35_x64;
             }
         }
     }
@@ -2907,6 +3049,51 @@ int main(int argc, char* argv[]) {
         internal override PythonVersion Version {
             get {
                 return PythonPaths.Python25 ?? PythonPaths.Python25_x64;
+            }
+        }
+    }
+
+    [TestClass]
+    public class DebuggerTests26 : DebuggerTests {
+        [ClassInitialize]
+        public static new void DoDeployment(TestContext context) {
+            AssertListener.Initialize();
+            PythonTestData.Deploy();
+        }
+
+        internal override PythonVersion Version {
+            get {
+                return PythonPaths.Python26 ?? PythonPaths.Python26_x64;
+            }
+        }
+    }
+
+    [TestClass]
+    public class DebuggerTests27 : DebuggerTests {
+        [ClassInitialize]
+        public static new void DoDeployment(TestContext context) {
+            AssertListener.Initialize();
+            PythonTestData.Deploy();
+        }
+
+        internal override PythonVersion Version {
+            get {
+                return PythonPaths.Python27;
+            }
+        }
+    }
+
+    [TestClass]
+    public class DebuggerTests27_x64 : DebuggerTests {
+        [ClassInitialize]
+        public static new void DoDeployment(TestContext context) {
+            AssertListener.Initialize();
+            PythonTestData.Deploy();
+        }
+
+        internal override PythonVersion Version {
+            get {
+                return PythonPaths.Python27_x64;
             }
         }
     }
@@ -2936,6 +3123,7 @@ int main(int argc, char* argv[]) {
         public override void AttachThreadingStartNewThread() { }
         public override void AttachTimeoutThreadsInitialized() { }
         public override void AttachTimeout() { }
+        public override void AttachWithOutputRedirection() { }
 
         protected override string UnassignedLocalRepr {
             get { return "None"; }
